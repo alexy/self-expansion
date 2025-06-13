@@ -561,13 +561,63 @@ def main(do_clear_db=False, purpose="Support humanity"):
                 sg.messages(user=prompt, system=system_prompt),
                 result_format.model_json_schema(),
             )
-            expansion = result_format.model_validate_json(
-                result.choices[0].message.content
-            )
+            # Extract JSON from the response and parse it
+            raw_content = result.choices[0].message.content
+            print(f"Raw AI response: {raw_content[:200]}...")
+            
+            json_content = sg.extract_json_from_response(raw_content)
+            print(f"Extracted JSON: {json_content[:200]}...")
+            
+            # Repair the JSON to fix common format issues
+            repaired_json = sg.repair_json(json_content)
+            print(f"Repaired JSON: {repaired_json[:200]}...")
+            
+            # Additional fix: convert format if AI generated wrong structure
+            import json
+            try:
+                data = json.loads(repaired_json)
+                
+                # If we're at a Question node but got questions/concepts instead of answer
+                if current_node_label == "Question" and 'questions' in data and 'answer' not in data:
+                    # Convert the first question to an answer
+                    if data['questions']:
+                        first_question = data['questions'][0]
+                        answer_text = f"This relates to the question: {first_question.get('text', 'unknown')}"
+                    else:
+                        answer_text = "Based on current understanding, this requires further investigation."
+                    
+                    data = {
+                        "answer": [{"type": "Answer", "text": answer_text}]
+                    }
+                    repaired_json = json.dumps(data)
+                    print(f"Converted to answer format: {repaired_json[:200]}...")
+                
+            except:
+                pass  # If conversion fails, use original repaired_json
+            
+            # Try to parse the JSON
+            try:
+                expansion = result_format.model_validate_json(repaired_json)
+            except Exception as parse_error:
+                print(f"JSON parsing failed: {parse_error}")
+                print(f"Full extracted content: {json_content}")
+                print(f"Full repaired content: {repaired_json}")
+                raise
         except Exception as e:
             print(f"Error generating expansion: {e}")
-            # Return to the core node
-            current_node_id = core_node_id
+            # Return to the core node (only if we're not already there)
+            if current_node_id != core_node_id:
+                print("Returning to core node due to error")
+                current_node_id = core_node_id
+            else:
+                print("Already at core node, continuing with empty expansion")
+                # Create minimal expansion to continue
+                if current_node_label == "Question":
+                    expansion = FromQuestion(answer=[Answer(type="Answer", text="Unable to generate answer due to error")])
+                elif current_node_label == "Answer":
+                    expansion = FromAnswer(concepts=[], questions=[])
+                else:  # Concept or Core
+                    expansion = FromConcept(questions=[], concepts=[])
             continue
 
         # Link the new nodes to the current node.
@@ -650,6 +700,10 @@ def main(do_clear_db=False, purpose="Support humanity"):
                 choices=list(selectable_nodes),
             )
 
+            print(f"AI selected: '{node_selection}'")
+            print(f"Available choices: {sorted(selectable_nodes)}")
+            print(f"Available in mapping: {sorted(simple_to_uuid_mapping.keys())}")
+
             is_random = node_selection == "random"
             is_core = node_selection == "core"
 
@@ -657,15 +711,21 @@ def main(do_clear_db=False, purpose="Support humanity"):
                 current_node_id = random_node_id()
             elif is_core:
                 current_node_id = core_node_id
-            else:
+            elif node_selection in simple_to_uuid_mapping:
                 current_node_id = simple_to_uuid_mapping[node_selection]
+            else:
+                print(f"ERROR: Selected node '{node_selection}' not found in mapping")
+                print(f"Falling back to random node selection")
+                current_node_id = random_node_id()
 
             # Print the node label + text
             print(f"SELECTED {node_selection} {current_node_id}")
             node = load_node(current_node_id)
             print(f"SELECTED {node['label'].upper()} {node['node_text']}\n")
 
-            history.append(current_node)
+            # Only add to history if it's different from the last entry
+            if not history or history[-1]['node_text'] != current_node['node_text']:
+                history.append(current_node)
 
             traversal_type = (
                 "random" if is_random else "core" if is_core else "neighbor"
